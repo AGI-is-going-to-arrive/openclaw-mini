@@ -50,18 +50,25 @@ import {
 } from "./session-key.js";
 import { enqueueInLane, resolveGlobalLane, resolveSessionLane, setLaneConcurrency } from "./command-queue.js";
 import { filterToolsByPolicy, type ToolPolicy } from "./tool-policy.js";
-import { emitAgentEvent } from "./agent-events.js";
+import type { MiniAgentEvent } from "./agent-events.js";
 import { runAgentLoop } from "./agent-loop.js";
 import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
 import type { Model, StreamFunction } from "@mariozechner/pi-ai";
-import { streamSimple, completeSimple, getModel } from "@mariozechner/pi-ai";
+import { streamSimple, completeSimple, getModel, getEnvApiKey } from "@mariozechner/pi-ai";
 
 // ============== 类型定义 ==============
 
 export interface AgentConfig {
-  /** API Key（向后兼容：未指定 streamFn 时作为 Anthropic key 使用） */
+  /** API Key（不指定则通过 pi-ai getEnvApiKey 从环境变量自动获取） */
   apiKey?: string;
-  /** 模型 ID（向后兼容：未指定 model 对象时用于创建默认 Anthropic model） */
+  /**
+   * Provider 名称
+   *
+   * 对应 pi-ai KnownProvider，如 "anthropic" | "openai" | "google" | "groq" 等
+   * 默认 "anthropic"
+   */
+  provider?: string;
+  /** 模型 ID（需与 provider 匹配，如 "claude-sonnet-4-20250514" / "gpt-4.1" / "gemini-2.5-pro"） */
   model?: string;
   /**
    * Provider 流式调用函数
@@ -75,7 +82,7 @@ export interface AgentConfig {
    * 模型定义
    *
    * 对应 OpenClaw: pi-ai → Model<TApi>
-   * - 不指定则通过 getModel("anthropic", modelId) 获取
+   * - 不指定则通过 getModel(provider, modelId) 获取
    */
   modelDef?: Model<any>;
   /** Agent ID（默认 main） */
@@ -122,27 +129,6 @@ export interface AgentConfig {
    * - global lane 控制不同 session 间可同时跑几个（默认 2）
    */
   maxConcurrentRuns?: number;
-}
-
-export interface AgentCallbacks {
-  /** 流式文本增量 */
-  onTextDelta?: (delta: string) => void;
-  /** 文本完成 */
-  onTextComplete?: (text: string) => void;
-  /** 工具调用开始 */
-  onToolStart?: (name: string, input: unknown) => void;
-  /** 工具调用结束 */
-  onToolEnd?: (name: string, result: string) => void;
-  /** 轮次开始 */
-  onTurnStart?: (turn: number) => void;
-  /** 轮次结束 */
-  onTurnEnd?: (turn: number) => void;
-  /** 技能匹配 */
-  onSkillMatch?: (match: SkillMatch) => void;
-  /** 记忆检索 */
-  onMemorySearch?: (results: MemorySearchResult[]) => void;
-  /** Heartbeat 触发（传入 HEARTBEAT.md 原始内容，不做解析） */
-  onHeartbeat?: (content: string) => void;
 }
 
 export interface RunResult {
@@ -249,17 +235,27 @@ export class Agent {
    */
   private toolResultGuard: ReturnType<typeof installSessionToolResultGuard>;
 
+  /**
+   * 事件订阅者
+   *
+   * 对应 pi-agent-core/agent.js → Agent.listeners: Set<fn>
+   * - subscribe() 添加监听器，返回 unsubscribe 函数
+   * - emit() 遍历 listeners 同步调用
+   */
+  private listeners = new Set<(event: MiniAgentEvent) => void>();
+
   constructor(config: AgentConfig) {
     // Provider 初始化（对应 OpenClaw: attempt.ts → activeSession.agent.streamFn）
-    const modelId = config.model ?? "claude-sonnet-4-20250514";
-    this.modelDef = config.modelDef ?? getModel("anthropic", modelId as any);
+    const provider = config.provider ?? "anthropic";
+    const modelId = config.model ?? (provider === "anthropic" ? "claude-sonnet-4-20250514" : undefined);
+    this.modelDef = config.modelDef ?? getModel(provider as any, modelId as any);
     this.streamFn = config.streamFn ?? streamSimple;
     this.agentId = normalizeAgentId(config.agentId ?? "main");
     this.baseSystemPrompt = config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.tools = config.tools ?? builtinTools;
     this.maxTurns = config.maxTurns ?? 20;
     this.workspaceDir = config.workspaceDir ?? process.cwd();
-    this.apiKey = config.apiKey;
+    this.apiKey = config.apiKey ?? getEnvApiKey(provider);
     this.temperature = config.temperature;
     this.toolPolicy = config.toolPolicy;
     this.contextTokens = Math.max(
@@ -293,6 +289,35 @@ export class Agent {
 
     // Tool Result Guard（对应 OpenClaw: attempt.ts → guardSessionManager()）
     this.toolResultGuard = installSessionToolResultGuard(this.sessions);
+  }
+
+  // ============== 事件订阅（对齐 pi-agent-core Agent） ==============
+
+  /**
+   * 订阅 Agent 事件
+   *
+   * 对应 pi-agent-core/agent.js → Agent.subscribe(fn)
+   * - 返回 unsubscribe 函数
+   * - 事件在 run() 中同步 emit
+   */
+  subscribe(fn: (event: MiniAgentEvent) => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  /**
+   * 向所有订阅者发送事件
+   *
+   * 对应 pi-agent-core/agent.js → Agent.emit(e)
+   */
+  private emit(event: MiniAgentEvent): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // 忽略监听器错误，避免影响主流程
+      }
+    }
   }
 
   /**
@@ -335,16 +360,10 @@ export class Agent {
     });
 
     if (compacted.summary && compacted.summaryMessage) {
-      emitAgentEvent({
-        runId: params.runId,
-        stream: "lifecycle",
-        sessionKey: params.sessionKey,
-        agentId: this.agentId,
-        data: {
-          phase: "compaction",
-          summaryChars: compacted.summary.length,
-          droppedMessages: compacted.pruneResult.droppedMessages.length,
-        },
+      this.emit({
+        type: "compaction",
+        summaryChars: compacted.summary.length,
+        droppedMessages: compacted.pruneResult.droppedMessages.length,
       });
     }
 
@@ -416,18 +435,12 @@ export class Agent {
     runPromise
       .then(async (result) => {
         const summary = result.text.slice(0, 600);
-        emitAgentEvent({
-          runId: result.runId ?? childSessionKey,
-          stream: "subagent",
-          sessionKey: params.parentSessionKey,
-          agentId: this.agentId,
-          data: {
-            phase: "summary",
-            childSessionKey,
-            label: params.label,
-            task: params.task,
-            summary,
-          },
+        this.emit({
+          type: "subagent_summary",
+          childSessionKey,
+          label: params.label,
+          task: params.task,
+          summary,
         });
         const summaryMsg: Message = {
           role: "user",
@@ -440,18 +453,12 @@ export class Agent {
         }
       })
       .catch((err) => {
-        emitAgentEvent({
-          runId: childSessionKey,
-          stream: "subagent",
-          sessionKey: params.parentSessionKey,
-          agentId: this.agentId,
-          data: {
-            phase: "error",
-            childSessionKey,
-            label: params.label,
-            task: params.task,
-            error: err instanceof Error ? err.message : String(err),
-          },
+        this.emit({
+          type: "subagent_error",
+          childSessionKey,
+          label: params.label,
+          task: params.task,
+          error: err instanceof Error ? err.message : String(err),
         });
       });
     return {
@@ -510,7 +517,6 @@ export class Agent {
   async run(
     sessionIdOrKey: string,
     userMessage: string,
-    callbacks?: AgentCallbacks,
   ): Promise<RunResult> {
     const sessionKey = resolveSessionKey({
       agentId: this.agentId,
@@ -523,7 +529,6 @@ export class Agent {
     return enqueueInLane(sessionLane, () =>
       enqueueInLane(globalLane, async () => {
         const runId = crypto.randomUUID();
-        const startedAt = Date.now();
 
         // AbortController: 每次 run 创建独立的 controller
         const runAbortController = new AbortController();
@@ -534,12 +539,12 @@ export class Agent {
           this.steeringQueues.set(sessionKey, []);
         }
 
-        emitAgentEvent({
+        this.emit({
+          type: "agent_start",
           runId,
-          stream: "lifecycle",
           sessionKey,
           agentId: this.agentId,
-          data: { phase: "start", startedAt, model: this.modelDef.id },
+          model: this.modelDef.id,
         });
 
         try {
@@ -576,7 +581,6 @@ export class Agent {
             abortSignal: runAbortController.signal,
             onMemorySearch: (results) => {
               memoriesUsed += results.length;
-              callbacks?.onMemorySearch?.(results);
             },
             spawnSubagent: async ({ task, label, cleanup }) =>
               this.spawnSubagent({
@@ -595,7 +599,6 @@ export class Agent {
           if (this.enableSkills) {
             const match = await this.skills.match(userMessage);
             if (match) {
-              callbacks?.onSkillMatch?.(match);
               skillTriggered = match.command.skillName;
               // 对齐 OpenClaw: 改写消息告诉模型使用哪个技能
               // 模型收到后扫描 <available_skills>，找到对应 skill，
@@ -655,8 +658,8 @@ export class Agent {
           const rawTools = this.resolveToolsForRun();
           const toolsForRun = rawTools.map((t) => wrapToolWithAbortSignal(t, runAbortController.signal));
 
-          // ===== Agent Loop（提取到 agent-loop.ts） =====
-          // 对应 OpenClaw: getSteeringMessages — 异步回调，drain 队列并转为 Message[]
+          // ===== Agent Loop（EventStream 模式） =====
+          // 对应 pi-agent-core: Agent._runLoop() → for await (const event of stream)
           const getSteeringMessages = async (): Promise<Message[]> => {
             const queue = this.steeringQueues.get(sessionKey);
             if (!queue || queue.length === 0) return [];
@@ -668,7 +671,7 @@ export class Agent {
             }));
           };
 
-          const loopResult = await runAgentLoop({
+          const stream = runAgentLoop({
             runId,
             sessionKey,
             agentId: this.agentId,
@@ -684,7 +687,6 @@ export class Agent {
             maxTurns: this.maxTurns,
             contextTokens: this.contextTokens,
             getSteeringMessages,
-            callbacks,
             appendMessage: (sk, msg) => this.sessions.append(sk, msg),
             prepareCompaction: async (p) => {
               const r = await this.prepareMessagesForRun(p);
@@ -693,20 +695,21 @@ export class Agent {
             abortSignal: runAbortController.signal,
           });
 
-          const endedAt = Date.now();
-          emitAgentEvent({
-            runId,
-            stream: "lifecycle",
-            sessionKey,
-            agentId: this.agentId,
-            data: {
-              phase: "end",
-              startedAt,
-              endedAt,
-              turns: loopResult.turns,
-              toolCalls: loopResult.totalToolCalls,
-            },
-          });
+          // 对应 pi-agent-core: for await (const event of stream) + emit + state update
+          let loopError: string | undefined;
+          for await (const event of stream) {
+            this.emit(event);
+
+            if (event.type === "agent_error") {
+              loopError = event.error;
+            }
+          }
+
+          const loopResult = await stream.result();
+
+          if (loopError) {
+            throw new Error(loopError);
+          }
 
           return {
             runId,
@@ -717,17 +720,10 @@ export class Agent {
             memoriesUsed,
           };
         } catch (err) {
-          emitAgentEvent({
+          this.emit({
+            type: "agent_error",
             runId,
-            stream: "lifecycle",
-            sessionKey,
-            agentId: this.agentId,
-            data: {
-              phase: "error",
-              startedAt,
-              endedAt: Date.now(),
-              error: err instanceof Error ? err.message : String(err),
-            },
+            error: err instanceof Error ? err.message : String(err),
           });
           throw err;
         } finally {

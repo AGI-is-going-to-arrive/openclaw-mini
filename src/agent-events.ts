@@ -1,48 +1,97 @@
 /**
- * Agent 事件流（简化版）
+ * Agent 事件类型定义
  *
- * 目标：提供可观测性与可追踪性，让运行过程可订阅。
- * 参考 OpenClaw: src/infra/agent-events.ts
+ * 对应 OpenClaw:
+ * - pi-agent-core/types.d.ts → AgentEvent 判别联合类型
+ * - pi-ai/utils/event-stream.js → EventStream<T, R> 泛型事件流
+ *
+ * 架构对齐:
+ * - 全局事件总线 → 已移除（原 emitAgentEvent / onAgentEvent）
+ * - 替代方案: Agent 实例级 subscribe()/emit() 模式
+ *   （对应 pi-agent-core Agent.listeners + Agent.emit()）
+ * - EventStream 从 pi-ai 直接导入（DRY，不重新实现）
+ *
+ * 事件流向（三层架构）:
+ *   Layer 1: agent-loop → stream.push(MiniAgentEvent) → EventStream 队列
+ *   Layer 2: Agent.run() → for await (event of stream) → 消费事件
+ *   Layer 3: Agent.emit(event) → listeners → 外部订阅者（CLI 等）
  */
 
-export type AgentEventStream = "lifecycle" | "assistant" | "tool" | "subagent" | "error";
+import { EventStream } from "@mariozechner/pi-ai";
+import type { Message } from "./session.js";
 
-export type AgentEventPayload = {
-  runId: string;
-  seq: number;
-  ts: number;
-  stream: AgentEventStream;
-  data: Record<string, unknown>;
-  sessionKey?: string;
-  agentId?: string;
-};
+// ============== 事件类型（判别联合） ==============
 
-const listeners = new Set<(evt: AgentEventPayload) => void>();
-const seqByRun = new Map<string, number>();
+/**
+ * Agent 事件类型
+ *
+ * 对应 pi-agent-core AgentEvent，适配 mini 的 Message 类型:
+ * - 核心生命周期: agent_start → agent_end / agent_error
+ * - 轮次: turn_start → turn_end
+ * - 消息: message_start → message_delta* → message_end
+ * - 工具: tool_execution_start → tool_execution_end / tool_skipped
+ * - mini 特有: compaction, retry, steering, subagent, context_overflow_compact
+ */
+export type MiniAgentEvent =
+  // 核心生命周期（对齐 pi-agent-core: agent_start / agent_end）
+  | { type: "agent_start"; runId: string; sessionKey: string; agentId: string; model: string }
+  | { type: "agent_end"; runId: string; messages: Message[] }
+  | { type: "agent_error"; runId: string; error: string }
 
-export function emitAgentEvent(event: Omit<AgentEventPayload, "seq" | "ts">) {
-  const nextSeq = (seqByRun.get(event.runId) ?? 0) + 1;
-  seqByRun.set(event.runId, nextSeq);
-  const payload: AgentEventPayload = {
-    ...event,
-    seq: nextSeq,
-    ts: Date.now(),
-  };
-  for (const listener of listeners) {
-    try {
-      listener(payload);
-    } catch {
-      // 忽略监听器错误，避免影响主流程
-    }
-  }
-  // run 结束时清理序号计数器，防止长时间运行时泄漏
-  const data = event.data as { phase?: string };
-  if (data.phase === "end" || data.phase === "error") {
-    seqByRun.delete(event.runId);
-  }
+  // 轮次（对齐 pi-agent-core: turn_start / turn_end）
+  | { type: "turn_start"; turn: number }
+  | { type: "turn_end"; turn: number }
+
+  // 消息（对齐 pi-agent-core: message_start / message_update / message_end）
+  | { type: "message_start"; message: Message }
+  | { type: "message_delta"; delta: string }
+  | { type: "message_end"; message: Message; text: string }
+
+  // 工具执行（对齐 pi-agent-core: tool_execution_start / tool_execution_end）
+  | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: unknown }
+  | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: string; isError: boolean }
+  | { type: "tool_skipped"; toolCallId: string; toolName: string }
+
+  // mini 特有事件
+  | { type: "steering"; pendingCount: number }
+  | { type: "compaction"; summaryChars: number; droppedMessages: number }
+  | { type: "context_overflow_compact"; error: string }
+  | { type: "retry"; attempt: number; delay: number; error: string }
+  | { type: "subagent_summary"; childSessionKey: string; label?: string; task: string; summary: string }
+  | { type: "subagent_error"; childSessionKey: string; label?: string; task: string; error: string };
+
+// ============== 结果类型 ==============
+
+/**
+ * EventStream 的最终结果
+ *
+ * 当 stream 收到终止事件（agent_end / agent_error）时通过 extractResult 提取
+ */
+export interface MiniAgentResult {
+  finalText: string;
+  turns: number;
+  totalToolCalls: number;
+  messages: Message[];
 }
 
-export function onAgentEvent(listener: (evt: AgentEventPayload) => void): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+// ============== 工厂函数 ==============
+
+/**
+ * 创建 Agent 事件流
+ *
+ * 对应 pi-agent-core/agent-loop.js → createAgentStream()
+ * - isComplete: agent_end 或 agent_error 为终止事件
+ * - extractResult: 从终止事件中提取 MiniAgentResult
+ */
+export function createMiniAgentStream(): EventStream<MiniAgentEvent, MiniAgentResult> {
+  return new EventStream<MiniAgentEvent, MiniAgentResult>(
+    (event) => event.type === "agent_end" || event.type === "agent_error",
+    (event) => {
+      if (event.type === "agent_end") {
+        return { finalText: "", turns: 0, totalToolCalls: 0, messages: event.messages };
+      }
+      // agent_error
+      return { finalText: "", turns: 0, totalToolCalls: 0, messages: [] };
+    },
+  );
 }

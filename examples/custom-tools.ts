@@ -1,5 +1,7 @@
 /**
  * 自定义工具示例
+ *
+ * 事件消费方式: agent.subscribe() 订阅类型化事件（对齐 pi-agent-core Agent.subscribe）
  */
 
 import { Agent, builtinTools, type Tool } from "../src/index.js";
@@ -60,19 +62,31 @@ async function main() {
 请帮助用户完成任务。`,
   });
 
-  console.log("🔧 自定义工具示例\n");
+  console.log("自定义工具示例\n");
+
+  // 订阅事件（流式文本 + 工具调用详情）
+  const unsubscribe = agent.subscribe((event) => {
+    switch (event.type) {
+      case "message_delta":
+        process.stdout.write(event.delta);
+        break;
+      case "tool_execution_start":
+        console.log(`\n[${event.toolName}]`, event.args);
+        break;
+      case "tool_execution_end":
+        console.log(`  → ${event.result}`);
+        break;
+    }
+  });
 
   const result = await agent.run(
     "custom-tools",
     "现在几点了？另外帮我算一下 (15 + 27) * 3 等于多少",
-    {
-      onTextDelta: (d) => process.stdout.write(d),
-      onToolStart: (name, input) => console.log(`\n[${name}]`, input),
-      onToolEnd: (name, result) => console.log(`  → ${result}`),
-    },
   );
 
   console.log(`\n\n完成: ${result.turns} 轮, ${result.toolCalls} 次工具调用`);
+
+  unsubscribe();
 }
 
 main().catch(console.error);

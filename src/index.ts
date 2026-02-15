@@ -10,20 +10,19 @@
  */
 
 // Agent 核心
-export { Agent, type AgentConfig, type AgentCallbacks, type RunResult } from "./agent.js";
+export { Agent, type AgentConfig, type RunResult } from "./agent.js";
 
 // Agent Loop
-export { runAgentLoop, type AgentLoopParams, type AgentLoopCallbacks, type AgentLoopResult } from "./agent-loop.js";
+export { runAgentLoop, type AgentLoopParams } from "./agent-loop.js";
 
 // 消息格式转换
 export { convertMessagesToPi } from "./message-convert.js";
 
-// 事件流
+// 事件流（EventStream 架构，对齐 pi-agent-core）
 export {
-  type AgentEventStream,
-  type AgentEventPayload,
-  emitAgentEvent,
-  onAgentEvent,
+  type MiniAgentEvent,
+  type MiniAgentResult,
+  createMiniAgentStream,
 } from "./agent-events.js";
 
 // 会话管理
